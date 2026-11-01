@@ -366,12 +366,18 @@ def _warmup_nse_session(raw_session):
         getattr(resp, "status_code", "?"),
         cookies,
     )
-
+NSE_PROXY_URL = os.getenv("NSE_PROXY_URL", "").strip()
 
 def _build_nse_client():
     """Fresh NSE client = fresh cookies + explicit /option-chain warmup."""
     client = NSE()
-    client.session.retries = 3      # paced by the patched request() below
+    client.session.retries = 2      # paced by the patched request() below
+    if NSE_PROXY_URL:
+        client.session.session.proxies = {
+            "http": NSE_PROXY_URL,
+            "https": NSE_PROXY_URL,
+        }
+        logger.info("Routing NSE traffic through NSE_PROXY_URL")
     try:
         _warmup_nse_session(client.session.session)
     except Exception as exc:
