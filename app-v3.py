@@ -143,7 +143,7 @@ Engine: atomic snapshot writes, side-aware event bias, hourly pruning,
 7-day retention, unique-index protection against duplicate rows.
 
 Requirements:
-    pip install "streamlit>=1.46" "plotly>=5" "pandas>=1.5" pnsea requests
+    pip install "streamlit>=1.46" "plotly>=5" "pandas>=1.5" pnsea
 Run:
     streamlit run app.py
 """
@@ -169,7 +169,6 @@ from typing import Dict, List, Optional, Tuple
 from zoneinfo import ZoneInfo
 
 import pandas as pd
-import requests
 import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
@@ -201,8 +200,7 @@ IST               = ZoneInfo("Asia/Kolkata")
 # the old relative path silently created a brand-new empty DB whenever the
 # app was started from a different working directory (e.g. a .bat in
 # another folder), making all previously stored history "disappear".
-_DATA_DIR         = os.getenv("RENDER_DISK_PATH", str(Path(__file__).resolve().parent))
-DB_PATH           = os.path.join(_DATA_DIR, "options_history.db")
+DB_PATH           = str(Path(__file__).resolve().parent / "options_history.db")
 POLL_SECONDS      = 15          # background poller cadence (market hours)
 OFFHOURS_POLL_SECONDS = 60      # gentle cadence outside market hours
 BOOTSTRAP_RETRY_SECONDS = 30   # re-seed attempts while the DB looks empty
@@ -303,31 +301,6 @@ ACTIVITY_TAG_FLOOR = 500   # = REL_MIN_ABS: the smallest move the
                            # this are sub-threshold noise and stay untagged
 
 
-# ── Telegram Alerts (optional — set env vars or fill below) ─────────
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
-TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID", "")
-TELEGRAM_MIN_DOI   = int(os.getenv("TELEGRAM_MIN_DOI", "5000"))
-TELEGRAM_MAX_ITEMS = 15
-
-
-def send_telegram_alert(event_text: str):
-    """Send an HTML-formatted grouped alert to Telegram if configured."""
-    token = TELEGRAM_BOT_TOKEN.strip()
-    chat_id = TELEGRAM_CHAT_ID.strip()
-    if not token or not chat_id:
-        return
-    url = f"https://api.telegram.org/bot{token}/sendMessage"
-    payload = {
-        "chat_id": chat_id,
-        "text": event_text,
-        "parse_mode": "HTML",
-        "disable_web_page_preview": True,
-    }
-    try:
-        requests.post(url, json=payload, timeout=5)
-    except Exception as exc:
-        logger.warning("Telegram alert failed: %s", exc)
-
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 logger = logging.getLogger("nse_app")
@@ -348,61 +321,44 @@ logger = logging.getLogger("nse_app")
 #      every few seconds → sustained high CPU.
 
 
-def _warmup_nse_session(raw_session):
-    """Explicitly hit /option-chain so NSE Akamai sets nsit + nseappid cookies."""
-    raw_session.headers.update({
-        "Referer": "https://www.nseindia.com/option-chain",
-        "Accept": "application/json, text/javascript, */*; q=0.01",
-        "Accept-Language": "en-US,en;q=0.9",
-        "X-Requested-With": "XMLHttpRequest",
-    })
-    resp = raw_session.get(
-        "https://www.nseindia.com/option-chain",
-        timeout=NSE_HTTP_TIMEOUT,
-    )
-    cookies = list(raw_session.cookies.keys()) if hasattr(raw_session, "cookies") else []
-    logger.info(
-        "NSE warmup GET /option-chain -> HTTP %s | cookies=%s",
-        getattr(resp, "status_code", "?"),
-        cookies,
-    )
 NSE_PROXY_URL = os.getenv("NSE_PROXY_URL", "").strip()
 
+
 def _build_nse_client():
-    """Fresh NSE client = fresh cookies + explicit /option-chain warmup."""
+    """Fresh NSE client = fresh cookies. Used at startup and for every
+    scheduled/reactive rebuild — the only reliable way to refresh NSE's
+    short-lived cookies, which pnsea never does on its own."""
     client = NSE()
     client.session.retries = 2      # paced by the patched request() below
-    if NSE_PROXY_URL:
-        client.session.session.proxies = {
-            "http": NSE_PROXY_URL,
-            "https": NSE_PROXY_URL,
-        }
-        logger.info("Routing NSE traffic through NSE_PROXY_URL")
-    try:
-        _warmup_nse_session(client.session.session)
-    except Exception as exc:
-        logger.warning("NSE warmup request failed: %s", exc)
     return client
 
 
 def _harden_nse_http_stack():
-    """Timeout + paced-retry + full diagnostic logging on non-JSON / blocked responses."""
-    # 1) hard timeout on EVERY curl_cffi request (incl. cookie bootstrap)
+    """Timeout + proxy + paced-retry patches, applied once at import."""
+    # 1) hard timeout + optional proxy on EVERY curl_cffi request
+    #    (including the very first cookie bootstrap inside NSE().__init__!)
     try:
         import curl_cffi.requests as _cffi
         _orig_cffi_request = _cffi.Session.request
 
         def _cffi_request_with_timeout(self, method, url, **kwargs):
             kwargs.setdefault("timeout", NSE_HTTP_TIMEOUT)
+            if NSE_PROXY_URL and "nseindia.com" in str(url):
+                kwargs.setdefault("proxies", {
+                    "http": NSE_PROXY_URL,
+                    "https": NSE_PROXY_URL,
+                })
             return _orig_cffi_request(self, method, url, **kwargs)
 
         _cffi.Session.request = _cffi_request_with_timeout
+        if NSE_PROXY_URL:
+            logger.info("NSE proxy enabled for all requests (including initial bootstrap)")
     except Exception as exc:                      # pragma: no cover
-        logger.warning("curl_cffi timeout patch skipped: %s", exc)
+        logger.warning("curl_cffi timeout/proxy patch skipped: %s", exc)
 
     # 2) replace stealthkit's zero-delay retry loop with paced retries
-    #    that validate HTTP status + JSON body on /api/ calls and log
-    #    exact HTTP status, Content-Type, and body preview when NSE blocks
+    #    that RAISE on exhaustion (it used to return None after instant
+    #    retries, which then blew up inside pnsea as AttributeError)
     try:
         from stealthkit.stealth import StealthSession
 
@@ -410,34 +366,14 @@ def _harden_nse_http_stack():
             kwargs.setdefault("timeout", NSE_HTTP_TIMEOUT)
             attempts = max(1, int(getattr(self, "retries", 1) or 1))
             last_exc: Optional[BaseException] = None
-            is_api = "/api/" in str(url)
             for attempt in range(attempts):
                 try:
                     resp = self.session.request(method, url, **kwargs)
-                    if resp is None:
-                        raise ConnectionError(f"None response from {url}")
-                    status = getattr(resp, "status_code", 0)
-                    ctype = resp.headers.get("content-type", "") if hasattr(resp, "headers") else ""
-                    body = (resp.text or "").strip()
-                    if status == 200 and body and (not is_api or body.startswith(("{", "["))):
+                    if resp is not None:
                         return resp
-                    preview = body[:180].replace("\n", " ").replace("\r", " ")
-                    diag = (
-                        f"HTTP {status} | content-type={ctype!r} | "
-                        f"len={len(body)} | url={url} | body_preview={preview!r}"
-                    )
-                    logger.warning("NSE non-JSON / blocked response (attempt %d/%d): %s",
-                                   attempt + 1, attempts, diag)
-                    last_exc = ConnectionError(f"NSE blocked/non-JSON ({diag})")
-                    if is_api:
-                        try:
-                            _warmup_nse_session(self.session)
-                        except Exception as wexc:
-                            logger.warning("Re-warmup failed: %s", wexc)
+                    last_exc = ConnectionError(f"empty response from {url}")
                 except Exception as exc:
                     last_exc = exc
-                    logger.warning("HTTP request exception (attempt %d/%d) for %s: %r",
-                                   attempt + 1, attempts, url, exc)
                 if attempt < attempts - 1:
                     time.sleep(NSE_HTTP_RETRY_DELAY * (attempt + 1))
             raise last_exc if last_exc else ConnectionError(f"request failed: {url}")
@@ -1372,28 +1308,7 @@ class NiftyOptionEngine:
         m_open = market_open(now)
         if m_open or DETECT_OFFHOURS_EVENTS:
             events = self._detect_events(prev, combined, spot)
-            big_events = sorted(
-                [e for e in events if abs(e["d_oi"]) >= TELEGRAM_MIN_DOI],
-                key=lambda x: abs(x["d_oi"]),
-                reverse=True,
-            )[:TELEGRAM_MAX_ITEMS]
-            if big_events:
-                lines = [
-                    f"⏱️ <b>{html.escape(str(symbol))} ({html.escape(str(expiry))}) — "
-                    f"{now.strftime('%H:%M:%S')}</b> | Spot: <b>{spot:,.2f}</b>"
-                ]
-                for e in big_events:
-                    cls = e["classification"]
-                    label = CLASS_META.get(cls, {}).get("label", cls)
-                    sign = event_sign(cls, e["side"])
-                    emoji = SIGN_EMOJI.get(sign, "🚨")
-                    lines.append(
-                        f"{emoji} <b>{html.escape(str(label))}</b> | "
-                        f"<b>{e['strike']:,.0f} {html.escape(str(e['side']))}</b> | "
-                        f"Δ OI: <b>{e['d_oi']:+,.0f}</b> (Prem {e['d_ltp_pct']:+.1f}%)\n"
-                        f"<i>{html.escape(str(e['note']))}</i>"
-                    )
-                send_telegram_alert("\n\n".join(lines))
+
         else:
             events = []
 
